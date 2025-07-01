@@ -1,0 +1,2010 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+from matplotlib.animation import FuncAnimation
+from scipy.linalg import pinv
+
+class RLModelFreeController:
+    """
+    Reinforcement Learning Based Model-Free Optimized Trajectory Tracking Strategy
+    untuk AUV berdasarkan paper: Neurocomputing 469 (2022) 289–297
+    
+    Implementasi Hamilton-Jacobi-Isaac (HJI) equation dengan RL algorithm
+    untuk mencari optimal control tanpa memerlukan knowledge tentang dynamics AUV
+    """
+    
+    def __init__(self, state_dim=6, control_dim=2, learning_rate=0.01, discount_factor=0.95):
+        """
+        Inisialisasi RL Model-Free Controller
+        
+        Parameters:
+            state_dim: Dimensi state [x, y, psi, u, v, r]
+            control_dim: Dimensi control input [surge, yaw]
+            learning_rate: Learning rate untuk weight update
+            discount_factor: Discount factor (alpha) untuk HJI equation
+        """
+        self.state_dim = state_dim
+        self.control_dim = control_dim
+        self.learning_rate = learning_rate
+        self.alpha = discount_factor  # Discount factor dari HJI equation
+        
+        # Neural Network parameters untuk Value Function approximation
+        self.hidden_size = 10
+        self.basis_order = 3  # Order polynomial basis functions
+        
+        # Weight matrices untuk Neural Networks
+        # Value function V(E) approximation 
+        self.W_F = np.random.normal(0, 0.1, (20, 1))  # Basis functions untuk value function
+        
+        # Control policy U approximation
+        self.W_u = np.random.normal(0, 0.1, (20, self.control_dim))  # Control weights
+        
+        # Disturbance policy d approximation  
+        self.W_d = np.random.normal(0, 0.1, (20, self.state_dim))  # Disturbance weights
+        
+        # Performance weights (Q, R matrices)
+        self.Q = np.diag([10.0, 10.0, 5.0, 1.0, 1.0, 2.0])  # State penalty
+        self.R = np.diag([1.0, 1.0])  # Control penalty
+        self.gamma = 1.0  # L2-gain attenuation level
+        
+        # Data collection untuk least squares update
+        self.data_buffer = []
+        self.buffer_size = 50
+        self.iteration_count = 0
+        
+        # Exploration noise parameters
+        self.exploration_noise_std = 0.1
+        self.noise_decay = 0.995
+        
+        # Tracking variables
+        self.prev_state = np.zeros(self.state_dim)
+        self.prev_control = np.zeros(self.control_dim)
+        self.prev_value = 0.0
+        
+    def polynomial_basis(self, x, order=3):
+        """
+        Generate polynomial basis functions untuk neural network approximation
+        """
+        x = np.array(x).flatten()
+        n = len(x)
+        basis = []
+        
+        # Constant term
+        basis.append(1.0)
+        
+        # Linear terms
+        for i in range(n):
+            basis.append(x[i])
+            
+        # Quadratic terms
+        if order >= 2:
+            for i in range(n):
+                basis.append(x[i]**2)
+            for i in range(n):
+                for j in range(i+1, n):
+                    basis.append(x[i] * x[j])
+        
+        # Cubic terms
+        if order >= 3:
+            for i in range(n):
+                basis.append(x[i]**3)
+                
+        return np.array(basis[:20])  # Limit to 20 basis functions
+    
+    def value_function(self, error_state):
+        """
+        Approximate value function V(E) menggunakan neural network
+        """
+        phi_F = self.polynomial_basis(error_state, self.basis_order)
+        if len(phi_F) < len(self.W_F):
+            phi_F = np.pad(phi_F, (0, len(self.W_F) - len(phi_F)), 'constant')
+        elif len(phi_F) > len(self.W_F):
+            phi_F = phi_F[:len(self.W_F)]
+            
+        value = np.dot(self.W_F.flatten(), phi_F)
+        return value
+    
+    def control_policy(self, error_state):
+        """
+        Optimal control policy U*(E) dari HJI equation
+        """
+        phi_u = self.polynomial_basis(error_state, self.basis_order)
+        if len(phi_u) < self.W_u.shape[0]:
+            phi_u = np.pad(phi_u, (0, self.W_u.shape[0] - len(phi_u)), 'constant')
+        elif len(phi_u) > self.W_u.shape[0]:
+            phi_u = phi_u[:self.W_u.shape[0]]
+            
+        # Compute control dari Neural Network
+        control = np.dot(self.W_u.T, phi_u)
+        
+        # Add exploration noise untuk learning
+        if self.iteration_count < 1000:  # Exploration phase
+            noise = np.random.normal(0, self.exploration_noise_std, self.control_dim)
+            control += noise
+            self.exploration_noise_std *= self.noise_decay
+            
+        return control
+    
+    def disturbance_policy(self, error_state):
+        """
+        Worst-case disturbance policy d*(E) dari HJI equation
+        """
+        phi_d = self.polynomial_basis(error_state, self.basis_order)
+        if len(phi_d) < self.W_d.shape[0]:
+            phi_d = np.pad(phi_d, (0, self.W_d.shape[0] - len(phi_d)), 'constant')
+        elif len(phi_d) > self.W_d.shape[0]:
+            phi_d = phi_d[:self.W_d.shape[0]]
+            
+        disturbance = np.dot(self.W_d.T, phi_d)
+        
+        # Bound disturbance sesuai Assumption 3 dalam paper
+        max_dist = 0.5  # Maximum disturbance magnitude
+        disturbance = np.clip(disturbance, -max_dist, max_dist)
+        
+        return disturbance
+    
+    def performance_index(self, error_state, control, disturbance):
+        """
+        Performance index X(E, U, d) dari equation (12)
+        """
+        quad_cost = error_state.T @ self.Q @ error_state
+        control_cost = control.T @ self.R @ control
+        disturbance_cost = self.gamma**2 * np.linalg.norm(disturbance)**2
+        
+        return quad_cost + control_cost - disturbance_cost
+    
+    def bellman_error(self, error_state, control, disturbance, next_error_state, dt):
+        """
+        Compute Bellman error untuk HJI equation - equation (17)
+        """
+        current_value = self.value_function(error_state)
+        next_value = self.value_function(next_error_state)
+        
+        # Performance index
+        perf_index = self.performance_index(error_state, control, disturbance)
+        
+        # Bellman equation: H = X - alpha*V + dV/dt ≈ 0
+        bellman_error = (perf_index - self.alpha * current_value + 
+                        (next_value - current_value) / dt)
+        
+        return bellman_error
+    
+    def collect_data(self, error_state, control, disturbance, next_error_state, dt):
+        """
+        Collect data untuk least squares weight update
+        """
+        # Compute regression matrix phi dan target
+        phi_F = self.polynomial_basis(error_state, self.basis_order)
+        phi_u = self.polynomial_basis(error_state, self.basis_order)
+        phi_d = self.polynomial_basis(error_state, self.basis_order)
+        
+        # Ensure consistent dimensions
+        max_len = max(len(phi_F), len(phi_u), len(phi_d))
+        if len(phi_F) < max_len:
+            phi_F = np.pad(phi_F, (0, max_len - len(phi_F)), 'constant')
+        if len(phi_u) < max_len:
+            phi_u = np.pad(phi_u, (0, max_len - len(phi_u)), 'constant')
+        if len(phi_d) < max_len:
+            phi_d = np.pad(phi_d, (0, max_len - len(phi_d)), 'constant')
+            
+        # Limit to expected dimensions
+        phi_F = phi_F[:len(self.W_F)]
+        phi_u = phi_u[:self.W_u.shape[0]] 
+        phi_d = phi_d[:self.W_d.shape[0]]
+        
+        # Target value untuk least squares
+        perf_index = self.performance_index(error_state, control, disturbance)
+        next_value = self.value_function(next_error_state)
+        target = perf_index + self.alpha * next_value
+        
+        # Store data
+        data_point = {
+            'phi_F': phi_F,
+            'phi_u': phi_u, 
+            'phi_d': phi_d,
+            'target': target,
+            'error_state': error_state.copy(),
+            'control': control.copy(),
+            'disturbance': disturbance.copy()
+        }
+        
+        self.data_buffer.append(data_point)
+        
+        # Keep buffer size manageable
+        if len(self.data_buffer) > self.buffer_size:
+            self.data_buffer.pop(0)
+    
+    def update_weights(self):
+        """
+        Update neural network weights menggunakan least squares method
+        sesuai equations (27)-(31) dalam paper
+        """
+        if len(self.data_buffer) < 10:  # Need sufficient data
+            return
+            
+        # Prepare regression matrices
+        Phi_F = []
+        targets = []
+        
+        for data in self.data_buffer:
+            Phi_F.append(data['phi_F'])
+            targets.append(data['target'])
+            
+        Phi_F = np.array(Phi_F)
+        targets = np.array(targets)
+        
+        # Least squares update untuk value function weights
+        try:
+            # W_F = (Phi_F^T Phi_F)^{-1} Phi_F^T targets - equation (30)
+            if Phi_F.shape[0] >= Phi_F.shape[1]:  # Overdetermined system
+                self.W_F = np.linalg.pinv(Phi_F) @ targets.reshape(-1, 1)
+            else:
+                # Use regularized least squares untuk underdetermined case
+                reg_param = 0.01
+                A = Phi_F.T @ Phi_F + reg_param * np.eye(Phi_F.shape[1])
+                b = Phi_F.T @ targets
+                self.W_F = np.linalg.solve(A, b).reshape(-1, 1)
+                
+        except np.linalg.LinAlgError:
+            # Fallback to gradient update if least squares fails
+            for data in self.data_buffer[-5:]:  # Use recent data
+                phi_F = data['phi_F'].reshape(-1, 1)
+                error = data['target'] - np.dot(self.W_F.flatten(), data['phi_F'])
+                self.W_F += self.learning_rate * error * phi_F
+    
+    def compute_optimal_control(self, current_state, reference_state, dt):
+        """
+        Main function untuk compute optimal control berdasarkan RL algorithm
+        
+        Parameters:
+            current_state: [x, y, psi, u, v, r] - current AUV state
+            reference_state: [x_d, y_d, psi_d, u_d, v_d, r_d] - reference trajectory
+            dt: Time step
+            
+        Returns:
+            optimal_control: [tau_u, tau_r] - optimal control inputs
+        """
+        # Compute tracking error
+        error_state = np.array(current_state) - np.array(reference_state)
+        
+        # Get optimal control dan disturbance dari policies
+        optimal_control = self.control_policy(error_state)
+        disturbance = self.disturbance_policy(error_state)
+        
+        # Bound control inputs
+        max_control = [100.0, 50.0]  # [max_surge, max_yaw]
+        optimal_control = np.clip(optimal_control, -np.array(max_control), max_control)
+        
+        # Simulate next state untuk data collection (simplified dynamics)
+        next_error_state = error_state + dt * (
+            0.1 * error_state + 0.01 * optimal_control[:len(error_state)] + 
+            0.005 * disturbance[:len(error_state)]
+        )
+        
+        # Collect data untuk learning
+        self.collect_data(error_state, optimal_control, disturbance, next_error_state, dt)
+        
+        # Update weights setiap beberapa iterations
+        if self.iteration_count % 10 == 0:
+            self.update_weights()
+            
+        # Store untuk next iteration
+        self.prev_state = error_state.copy()
+        self.prev_control = optimal_control.copy()
+        self.prev_value = self.value_function(error_state)
+        
+        self.iteration_count += 1
+        
+        return optimal_control
+    
+    def get_performance_metrics(self):
+        """
+        Get current performance metrics untuk analysis
+        """
+        if len(self.data_buffer) == 0:
+            return {}
+            
+        recent_data = self.data_buffer[-10:] if len(self.data_buffer) >= 10 else self.data_buffer
+        
+        # Average performance index
+        avg_performance = np.mean([
+            self.performance_index(data['error_state'], data['control'], data['disturbance'])
+            for data in recent_data
+        ])
+        
+        # Average control effort
+        avg_control_effort = np.mean([
+            np.linalg.norm(data['control']) for data in recent_data
+        ])
+        
+        # Current value function
+        current_value = self.prev_value
+        
+        return {
+            'avg_performance': avg_performance,
+            'avg_control_effort': avg_control_effort,
+            'current_value': current_value,
+            'exploration_noise': self.exploration_noise_std,
+            'iterations': self.iteration_count
+        }
+
+class NeuralNetworkPID:
+    """
+    Neural Network-based Self-Tuning PID Controller untuk AUV
+    Berdasarkan paper: "Neural Network-Based Self-Tuning PID Control for Underwater Vehicles"
+    """
+    
+    def __init__(self, input_size=7, hidden_size=3, output_size=3, learning_rate=0.01):
+        """
+        Inisialisasi Neural Network untuk auto-tuning PID
+        """
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.learning_rate = learning_rate
+        
+        # Inisialisasi weights dengan distribusi normal kecil
+        self.w_ji = np.random.normal(0, 0.1, (hidden_size, input_size))  # Input to hidden
+        self.v_ji = np.random.normal(0, 0.1, (output_size, hidden_size))  # Hidden to output
+        
+        # Storage untuk previous values
+        self.u_prev = 0.0
+        self.y_prev = 0.0
+        self.c_prev = 0.0
+        
+        # PID gains initialization
+        self.Kp = 1.0
+        self.Ki = 0.1
+        self.Kd = 0.01
+        
+        # PID internal states
+        self.integral = 0.0
+        self.prev_error = 0.0
+        
+    def sigmoid(self, x):
+        """Sigmoid activation function"""
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))  # Clipping untuk stabilitas
+    
+    def forward_pass(self, inputs):
+        """
+        Forward pass melalui neural network
+        """
+        # Hidden layer calculation
+        self.hidden_input = np.dot(self.w_ji, inputs)
+        self.hidden_output = self.sigmoid(self.hidden_input)
+        
+        # Output layer calculation
+        self.output_input = np.dot(self.v_ji, self.hidden_output)
+        self.output = self.sigmoid(self.output_input)
+        
+        # Scale outputs to reasonable PID gain ranges
+        Kp = self.output[0] * 10.0  # Scale Kp to 0-10
+        Ki = self.output[1] * 2.0   # Scale Ki to 0-2
+        Kd = self.output[2] * 1.0   # Scale Kd to 0-1
+        
+        return np.array([Kp, Ki, Kd])
+    
+    def backward_pass(self, inputs, error_y, control_signal):
+        """
+        Backward pass untuk update weights berdasarkan tracking error
+        """
+        # Gradient computation untuk output layer
+        if abs(control_signal) > 1e-10:  # Prevent division by zero
+            gradient_factor = error_y / control_signal
+        else:
+            gradient_factor = error_y
+            
+        # Update output layer weights (v_ji)
+        for i in range(self.output_size):
+            for j in range(self.hidden_size):
+                delta_v = self.learning_rate * gradient_factor * self.hidden_output[j]
+                self.v_ji[i, j] -= delta_v  # Negative gradient descent
+        
+        # Update hidden layer weights (w_ji)
+        for j in range(self.hidden_size):
+            # Compute delta for hidden layer
+            hidden_delta = self.hidden_output[j] * (1 - self.hidden_output[j])  # Sigmoid derivative
+            
+            for i in range(self.input_size):
+                delta_w = self.learning_rate * gradient_factor * hidden_delta * inputs[i]
+                self.w_ji[j, i] -= delta_w
+    
+    def pid_control(self, reference, measurement, dt):
+        """
+        PID control dengan gains yang di-tune oleh neural network
+        """
+        # Calculate error
+        error = reference - measurement
+        
+        # Prepare NN inputs: [u(n), u(n-1), y(n), y(n-1), C(n), C(n-1), error]
+        nn_inputs = np.array([
+            reference,           # u(n) - current reference
+            self.u_prev,        # u(n-1) - previous reference
+            measurement,        # y(n) - current output
+            self.y_prev,        # y(n-1) - previous output
+            0.0,               # C(n) - current control (will be updated)
+            self.c_prev,       # C(n-1) - previous control
+            error              # current error
+        ])
+        
+        # Get PID gains from neural network
+        gains = self.forward_pass(nn_inputs)
+        self.Kp, self.Ki, self.Kd = gains
+        
+        # Ensure gains are within reasonable bounds
+        self.Kp = np.clip(self.Kp, 0.1, 20.0)
+        self.Ki = np.clip(self.Ki, 0.0, 5.0)
+        self.Kd = np.clip(self.Kd, 0.0, 2.0)
+        
+        # PID calculation
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        
+        # Anti-windup untuk integral
+        self.integral = np.clip(self.integral, -50, 50)
+        
+        control_signal = (self.Kp * error + 
+                         self.Ki * self.integral + 
+                         self.Kd * derivative)
+        
+        # Update NN inputs dengan control signal yang baru
+        nn_inputs[4] = control_signal  # C(n)
+        
+        # Neural network learning (backpropagation)
+        if abs(control_signal) > 0.01:  # Only learn when there's significant control action
+            self.backward_pass(nn_inputs, error, control_signal)
+        
+        # Update previous values
+        self.u_prev = reference
+        self.y_prev = measurement
+        self.c_prev = control_signal
+        self.prev_error = error
+        
+        return control_signal
+
+def wrap_to_pi(angle):
+    """
+    Membungkus sudut ke dalam rentang [-pi, pi].
+    """
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+# Inisiasi kondisi awal dan parameter kontrol 
+def initialize_parameters():
+    # === Hull Parameters (Table 2.7) ===
+    hull = {
+        'rho': 1.03e3,          # kg/m³, Seawater Density
+        'A_f': 2.85e-2,         # m², Hull Frontal Area
+        'A_p': 2.26e-1,         # m², Hull Projected Area (xz plane)
+        'S_w': 7.09e-1,         # m², Hull Wetted Surface Area
+        'nabla': 3.15e-2,       # m³, Estimated Hull Volume
+        'B_est': 3.17e2,        # N, Estimated Hull Buoyancy
+        'x_cb_est': 5.54e-3     # m, Estimated Long. Center of Buoyancy
+    }
+
+    # === Non-Linear Maneuvering Coefficients: Forces (Table 4.2) ===
+    forces = {
+        'X_uu': -1.62e0,      # kg/m, Cross-flow Drag
+        'X_u': -9.30e-1,      # kg, Added Mass
+        'X_wq': -3.35e1,      # kg/rad, Added Mass Cross-term
+        'X_qq': -1.93e0,      # kg·m/rad, Added Mass Cross-term
+        'X_vr': 3.55e1,       # kg·m/rad, Added Mass Cross-term
+        'X_rr': -1.93e0,      # kg·m/rad, Added Mass Cross-term
+        'X_prop': 3.38e0,     # N, Propeller Thrust
+        'Y_vv': -1.31e2,      # kg/m, Cross-flow Drag
+        'Y_rr': 6.32e-1,      # kg·m/rad², Cross-flow Drag
+        'Y_uv': -2.86e1,      # kg/m, Body Lift Force and Fin Lift
+        'Y_v': -3.55e1,       # kg, Added Mass
+        'Y_r': 1.93e0,        # kg·m/rad, Added Mass
+        'Y_ur': 5.22e0,       # kg/rad, Added Mass Cross Term and Fin Lift
+        'Y_wp': 3.55e1,       # kg/rad, Added Mass Cross-term
+        'Y_pq': 1.93e0,       # kg·m/rad, Added Mass Cross-term
+        'Y_udr': 9.64e0,      # kg/(m·rad), Fin Lift Force
+        'Z_ww': -1.31e2,      # kg/m, Cross-flow Drag
+        'Z_qq': -6.32e-1,     # kg·m/rad², Cross-flow Drag
+        'Z_uw': -2.86e1,      # kg/m, Body Lift Force and Fin Lift
+        'Z_w': -1.93e0,       # kg, Added Mass
+        'Z_qdot': -1.93e0,    # kg·m/rad, Added Mass
+        'Z_uq': -5.22e0,      # kg/rad, Added Mass Cross Term and Fin Lift
+        'Z_vp': -3.55e1,      # kg/rad, Added Mass Cross-term
+        'Z_rp': 1.93e0,       # kg/rad, Added Mass Cross-term
+        'Z_uuds': -9.64e0     # kg/(m·rad), Fin Lift Force
+    }
+
+    # === Non-Linear Maneuvering Coefficients: Moments (Table 4.3) ===
+    moments = {
+        'K_pp': -1.30e-3,      # kg·m²/rad², Rolling Resistance
+        'K_p': -1.41e-2,       # kg·m²/rad, Added Mass
+        'K_prop': -5.43e-1,    # N·m, Propeller Torque
+        'M_ww': 3.18e0,        # kg, Cross-flow Drag
+        'M_qq': -9.40e1,       # kg·m²/rad², Cross-flow Drag
+        'M_uw': 2.40e1,        # kg, Body and Fin Lift and Munk Moment
+        'M_w': -1.93e0,        # kg·m, Added Mass
+        'M_qdot': -4.88e0,     # kg·m²/rad, Added Mass
+        'M_uq': -2.00e0,       # kg·m²/rad, Added Mass Cross Term and Fin Lift
+        'M_vp': -1.93e0,       # kg·m²/rad, Added Mass Cross-term
+        'M_rp': 4.86e0,        # kg·m²/rad², Added Mass Cross-term
+        'M_uuds': -6.15e0,     # kg/rad, Fin Lift Moment
+        'N_vv': -3.18e0,       # kg·m²/rad², Cross-flow Drag
+        'N_rr': -9.40e1,       # kg·m²/rad², Cross-flow Drag
+        'N_uw': -2.40e1,       # kg, Body and Fin Lift and Munk Moment
+        'N_v': 1.93e0,         # kg·m, Added Mass
+        'N_r': -4.88e0,        # kg·m²/rad, Added Mass
+        'N_ur': -2.00e0,       # kg·m²/rad, Added Mass Cross Term and Fin Lift
+        'N_wp': -1.93e0,       # kg·m²/rad, Added Mass Cross-term
+        'N_pq': -4.86e0,       # kg·m²/rad², Added Mass Cross-term
+        'N_uadr': -6.15e0      # kg/rad, Fin Lift Moment
+    }
+
+    # === Control and Simulation Parameters ===
+    control = {
+        'Lambda': np.diag([0.5, 0.5, 3.0, 2.0]),  # blockdiag{0.5I3, 0.5I3, 3, 2}
+        'KD': 1000 * np.eye(8),                  # KD = 1000I8
+        'KP': 100 * np.eye(8),                   # KP = 100I8
+        'K_theta': np.eye(5),                    # Reduced size for simplicity
+        'theta_hat': np.zeros(5),                # Parameter estimates
+        'theta_dot': np.zeros(5),
+        'B': np.eye(6),                          # Control input matrix, assuming 6 DOF
+        'u': np.array([0.0, 0.0]),              # Initialize control input [surge, yaw]
+        # Neural Network PID Controllers
+        'nn_pid_surge': NeuralNetworkPID(learning_rate=0.005),
+        'nn_pid_yaw': NeuralNetworkPID(learning_rate=0.005)
+    }
+
+    # === Simulation Parameters ===
+    simulation = {
+        'Tend': 80,                      # Simulation time for proper testing
+        'dt': 0.05,                      # Time step for stability
+        'waypoints': np.array([           # Improved waypoints for smooth path following
+            [0, 0],                      # Start point
+            [20, 0],                     # Move east
+            [20, 15],                    # Move north
+            [40, 15],                    # Move east again
+            [40, 30],                    # Move north
+            [60, 30],                    # Final eastward movement
+            [60, 45]                     # Final target
+        ]),
+        'switchRadius': 2.0,             # Radius to switch waypoint
+        'lookAhead': 4.0,                # Lookahead distance for LOS guidance
+        'lam_psi': 1.5,                  # Lambda for heading control
+        'k_psi': 2.0,                    # Gain for heading control
+        'lam_u': 0.8,                    # Lambda for surge control
+        'k_u': 20.0,                     # Gain for surge control
+        'phi_sat': 0.05,                 # Saturation parameter
+        'u_des': 1.0,                    # Desired surge velocity (m/s)
+        'n_max': 25,                     # Max propeller rev/s
+        'kT': 0.04,                      # Propeller thrust constant
+        'kM': 0.01,                      # Propeller torque constant
+        'delta_max': np.deg2rad(20),     # Maximum rudder angle (rad)
+        'Uc': 0.1,                       # Ocean current velocity (east) m/s
+        'Vc': 0.1                        # Ocean current velocity (north) m/s
+    }
+
+    return hull, forces, moments, control, simulation
+
+# 4. Implementasi LOS Guidance
+def los_guidance(eta, waypoints, wpIdx, simulation):
+    """
+    Menghitung desired heading (psi_d) dan cross-track error (e_ct) berdasarkan LOS Guidance.
+
+    Parameters:
+        eta (np.array): [x, y, psi]
+        waypoints (np.array): Array waypoints
+        wpIdx (int): Indeks waypoint saat ini
+        simulation (dict): Parameter simulasi
+
+    Returns:
+        psi_d (float): Desired heading
+        e_ct (float): Cross-track error
+        wpIdx_new (int): Updated waypoint index
+    """
+    if wpIdx >= len(waypoints)-1:
+        # Target dicapai
+        psi_d = eta[2]
+        e_ct = 0.0
+        return psi_d, e_ct, wpIdx
+
+    p_i = waypoints[wpIdx]
+    p_ip1 = waypoints[wpIdx + 1]
+    distance_to_wp = np.linalg.norm(eta[0:2] - p_ip1)
+
+    if distance_to_wp < simulation['switchRadius']:
+        wpIdx += 1
+        if wpIdx >= len(waypoints)-1:
+            psi_d = eta[2]
+            e_ct = 0.0
+            return psi_d, e_ct, wpIdx
+        p_i = waypoints[wpIdx]
+        p_ip1 = waypoints[wpIdx + 1]
+        distance_to_wp = np.linalg.norm(eta[0:2] - p_ip1)
+
+    psi_path = np.arctan2(p_ip1[1] - p_i[1], p_ip1[0] - p_i[0])
+    e = eta[0:2] - p_i
+    e_ct = -np.sin(psi_path)*e[0] + np.cos(psi_path)*e[1]
+    psi_d = psi_path - np.arctan(e_ct / simulation['lookAhead'])
+
+    return psi_d, e_ct, wpIdx
+
+# 5. Implementasi Neural Network PID Control
+def neural_network_pid_control(eta, nu, psi_d, simulation, control):
+    """
+    Menghitung input kontrol menggunakan Neural Network Auto-Tuning PID.
+
+    Parameters:
+        eta (np.array): [x, y, psi]
+        nu (np.array): [u, v, r]
+        psi_d (float): Desired heading
+        simulation (dict): Parameter simulasi
+        control (dict): Parameter kontrol
+
+    Returns:
+        u (np.array): Kontrol input [surge, yaw]
+        control (dict): Updated control parameters
+    """
+    dt = simulation['dt']
+    
+    # Surge control (velocity control)
+    current_surge_velocity = nu[0]
+    desired_surge_velocity = simulation['u_des']
+    tau_u = control['nn_pid_surge'].pid_control(desired_surge_velocity, current_surge_velocity, dt)
+    
+    # Yaw control (heading control)
+    current_heading = eta[2]
+    heading_error = wrap_to_pi(current_heading - psi_d)
+    tau_r = control['nn_pid_yaw'].pid_control(0.0, heading_error, dt)  # Target heading error = 0
+    
+    # Saturation
+    tau_u = np.clip(tau_u, -100.0, 100.0)
+    tau_r = np.clip(tau_r, -50.0, 50.0)
+    
+    u = np.array([tau_u, tau_r])
+    
+    return u, control
+
+def rl_model_free_control(eta, nu, psi_d, simulation, control):
+    """
+    RL Model-Free Control untuk AUV trajectory tracking
+    
+    Args:
+        eta: State [x, y, psi]
+        nu: Velocity [u, v, r]
+        psi_d: Desired heading
+        simulation: Simulation parameters
+        control: Control parameters dictionary
+    
+    Returns:
+        u_control: Control input [surge_force, yaw_moment]
+        control: Updated control dictionary
+    """
+    # Inisialisasi RL controller jika belum ada
+    if 'rl_controller' not in control:
+        control['rl_controller'] = RLModelFreeController()
+        control['rl_reference'] = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0])  # Reference trajectory state
+        print("🤖 RL Model-Free Controller initialized")
+    
+    rl_controller = control['rl_controller']
+    
+    # Update reference trajectory (simple waypoint following)
+    # Untuk tracking error: e = x - x_ref
+    x_ref = control['rl_reference'][0]  # Reference x position
+    y_ref = control['rl_reference'][1]  # Reference y position
+    psi_ref = psi_d  # Reference heading from LOS guidance
+    u_ref = control['rl_reference'][3]  # Reference surge velocity
+    v_ref = 0.0  # Reference sway velocity
+    r_ref = 0.0  # Reference yaw rate
+    
+    # Current state
+    current_state = np.array([eta[0], eta[1], eta[2], nu[0], nu[1], nu[2]])
+    reference_state = np.array([x_ref, y_ref, psi_ref, u_ref, v_ref, r_ref])
+    
+    # Tracking error
+    tracking_error = current_state - reference_state
+    
+    # Wrap heading error to [-pi, pi]
+    tracking_error[2] = wrap_to_pi(tracking_error[2])
+    
+    # Get control input from RL controller
+    control_input = rl_controller.control_policy(tracking_error)
+    
+    # Update RL controller (online learning)
+    if hasattr(control, 'prev_tracking_error'):
+        next_error = tracking_error.copy()  # Simplified next state estimation
+        rl_controller.collect_data(control['prev_tracking_error'], control_input, 
+                                 rl_controller.disturbance_policy(control['prev_tracking_error']),
+                                 next_error, simulation['dt'])
+        
+        # Update weights periodically
+        if rl_controller.iteration_count % 10 == 0:
+            rl_controller.update_weights()
+    
+    # Store previous error for next iteration
+    control['prev_tracking_error'] = tracking_error.copy()
+    
+    # Store RL specific data for logging
+    if 'rl_tracking_error' not in control:
+        control['rl_tracking_error'] = []
+        control['rl_control_input'] = []
+        control['rl_value_function'] = []
+    
+    control['rl_tracking_error'].append(tracking_error.copy())
+    control['rl_control_input'].append(control_input.copy())
+    
+    # Compute value function for logging
+    value_func = rl_controller.value_function(tracking_error)
+    control['rl_value_function'].append(value_func)
+    
+    # Increment iteration counter
+    rl_controller.iteration_count += 1
+    
+    # Scale control outputs to reasonable range
+    surge_force = np.clip(control_input[0] * 50.0, -100.0, 100.0)  # Scale surge control
+    yaw_moment = np.clip(control_input[1] * 20.0, -50.0, 50.0)    # Scale yaw control
+    
+    u_control = np.array([surge_force, yaw_moment])
+    
+    return u_control, control
+
+# 6. Integrasi Dinamika Sistem
+def system_dynamics(eta, nu, forces, moments, control, hull, simulation):
+    """
+    Menghitung perubahan keadaan (nudot, etadot) berdasarkan dinamika sistem.
+
+    Parameters:
+        eta (np.array): [x, y, psi]
+        nu (np.array): [u, v, r]
+        forces (dict): Koefisien gaya
+        moments (dict): Koefisien momen
+        control (dict): Parameter kontrol
+        hull (dict): Parameter hull
+        simulation (dict): Parameter simulasi
+
+    Returns:
+        nudot (np.array): Perubahan kecepatan
+        etadot (np.array): Perubahan posisi dan orientasi
+    """
+    # Compute hydrodynamic forces and moments based on current velocities
+    ur = nu[0]
+    vr = nu[1]
+    r = nu[2]
+
+    # Gaya X (Surge)
+    F_X = (forces['X_uu'] * ur * abs(ur) +
+           forces['X_wq'] * r * abs(r) +
+           forces['X_qq'] * r**2 * ur)
+
+    # Gaya Y (Sway)
+    F_Y = (forces['Y_vv'] * vr * abs(vr) +
+           forces['Y_rr'] * r**2 * vr +
+           forces['Y_uv'] * ur * vr +
+           forces['Y_v'] * vr +
+           forces['Y_r'] * r +
+           forces['Y_ur'] * ur * r +
+           forces['Y_wp'] * r +
+           forces['Y_pq'] * r**2 * ur +
+           forces['Y_udr'] * 0.0)  # Asumsi Fin Lift Force 2D = 0
+
+    # Momen Z (Yaw)
+    M_Z = (moments['N_rr'] * r**2 * vr +
+           moments['N_uw'] * ur * vr +
+           moments['N_v'] * vr +
+           moments['N_r'] * r +
+           moments['N_ur'] * ur * r +
+           moments['N_wp'] * r +
+           moments['N_pq'] * r**2 * ur +
+           moments['N_uadr'] * 0.0)  # Asumsi Fin Lift Moment 2D = 0
+
+    # Total Gaya dan Momen
+    F = np.array([F_X, F_Y, M_Z])
+
+    # Get control input
+    if 'u' in control:
+        tau = control['u']  # [Surge, Yaw] control input
+        # Expand to 3D if needed
+        if len(tau) == 2:
+            tau = np.array([tau[0], 0.0, tau[1]])  # [surge, sway, yaw]
+    else:
+        tau = np.array([0.0, 0.0, 0.0])
+
+    # Simplified mass matrix - reduced values for stability
+    m = 10.0  # kg, estimated mass (reduced)
+    I_z = 1.0  # kg*m^2, estimated moment of inertia (reduced)
+    M_matrix = np.diag([m, m, I_z])
+    
+    # Add damping for stability
+    damping_factor = 0.5
+    F[0] -= damping_factor * nu[0]  # Surge damping
+    F[1] -= damping_factor * nu[1]  # Sway damping  
+    F[2] -= damping_factor * nu[2]  # Yaw damping
+    
+    # Compute nudot = M^{-1} * (tau - F)
+    nudot = np.linalg.inv(M_matrix) @ (tau - F)
+    
+    # Limit acceleration for stability
+    max_accel = 2.0  # m/s^2
+    nudot = np.clip(nudot, -max_accel, max_accel)
+
+    # Compute etadot
+    R = np.array([
+        [np.cos(eta[2]), -np.sin(eta[2])],
+        [np.sin(eta[2]),  np.cos(eta[2])]
+    ])
+    etadot = np.array([
+        R[0,0] * nu[0] + R[0,1] * nu[1],
+        R[1,0] * nu[0] + R[1,1] * nu[1],
+        nu[2]
+    ])
+
+    return nudot, etadot
+
+# 7. Simulasi dan Visualisasi dengan Pre-Training dan Lyapunov Analysis
+def auv_adaptive_simulation_with_pretraining():
+    print("🚀 Starting AUV Simulation with Pre-Trained Neural Networks")
+    
+    # === Pre-Training Phase ===
+    trained_controllers = pre_train_neural_networks(epochs=1000)
+    
+    # Inisialisasi Parameter
+    hull, forces, moments, control, simulation = initialize_parameters()
+    
+    # Use pre-trained controllers
+    control['pretrained_surge'] = trained_controllers['nn_pid_surge']
+    control['pretrained_yaw'] = trained_controllers['nn_pid_yaw']
+
+    # Inisialisasi Kondisi Awal
+    eta = np.array([0.0, 0.0, 0.0])    # [x, y, psi] - start at origin
+    nu = np.array([0.1, 0.0, 0.0])     # [u, v, r] - small initial velocity
+    wpIdx = 0
+    int_eu = 0.0
+
+    # Inisialisasi Log Data
+    N_sim = int(np.ceil(simulation['Tend'] / simulation['dt'])) + 1
+    traj = np.full((N_sim, 5), np.nan)   # x, y, u, v, r
+    ct_err = np.full(N_sim, np.nan)
+    hdg_err = np.full(N_sim, np.nan)
+    t_vec = np.full(N_sim, np.nan)
+    control_u = np.full(N_sim, np.nan)
+    control_r = np.full(N_sim, np.nan)
+    
+    # Neural Network PID gains logging
+    kp_surge = np.full(N_sim, np.nan)
+    ki_surge = np.full(N_sim, np.nan)
+    kd_surge = np.full(N_sim, np.nan)
+    kp_yaw = np.full(N_sim, np.nan)
+    ki_yaw = np.full(N_sim, np.nan)
+    kd_yaw = np.full(N_sim, np.nan)
+    
+    # Lyapunov analysis logging
+    lyapunov_V = np.full(N_sim, np.nan)
+    lyapunov_V_dot = np.full(N_sim, np.nan)
+    stability_margin = np.full(N_sim, np.nan)
+    sliding_surface_norm = np.full(N_sim, np.nan)
+
+    # === Plot Setup ===
+    fig, axs = plt.subplots(2, 3, figsize=(18, 12))
+    # Subplot AUV XY Plane
+    ax1 = axs[0, 0]
+    ax1.set_title('AUV XY Plane (Pre-Trained NN-PID)')
+    ax1.set_xlabel('East [m]')
+    ax1.set_ylabel('North [m]')
+    ax1.plot(simulation['waypoints'][:,0], simulation['waypoints'][:,1], 'k--', linewidth=2, label='Waypoints')
+    ax1.plot(simulation['waypoints'][:,0], simulation['waypoints'][:,1], 'ko', markersize=8, markerfacecolor='k')
+    ax1.set_xlim(-5, 70)
+    ax1.set_ylim(-5, 50)
+    ax1.grid(True)
+    ax1.legend()
+    auv_shape, = ax1.plot([], [], 'b-', linewidth=2)  # AUV shape
+    traj_line, = ax1.plot([], [], 'r-', linewidth=2, label='Trajectory')
+
+    # Subplot Cross-Track Error
+    ax2 = axs[0, 1]
+    ax2.set_title('Cross-Track Error')
+    ax2.set_xlabel('Time [s]')
+    ax2.set_ylabel('e_ct [m]')
+    ax2.set_ylim(-3, 3)
+    ax2.grid(True)
+    err_ct_line, = ax2.plot([], [], 'b-', linewidth=2)
+
+    # Subplot Heading Error
+    ax3 = axs[0, 2]
+    ax3.set_title('Heading Error')
+    ax3.set_xlabel('Time [s]')
+    ax3.set_ylabel('e_psi [deg]')
+    ax3.set_ylim(-90, 90)
+    ax3.grid(True)
+    err_hdg_line, = ax3.plot([], [], 'r-', linewidth=2)
+
+    # Subplot Control Inputs
+    ax4 = axs[1, 0]
+    ax4.set_title('Control Inputs')
+    ax4.set_xlabel('Time [s]')
+    ax4.set_ylabel('Control [N/Nm]')
+    ax4.set_ylim(-120, 120)
+    ax4.grid(True)
+    tau_u_line, = ax4.plot([], [], 'g-', linewidth=2, label='Surge (tau_u)')
+    tau_r_line, = ax4.plot([], [], 'm-', linewidth=2, label='Yaw (tau_r)')
+    ax4.legend()
+
+    # Subplot Lyapunov Function
+    ax5 = axs[1, 1]
+    ax5.set_title('Lyapunov Stability Analysis')
+    ax5.set_xlabel('Time [s]')
+    ax5.set_ylabel('V & V̇')
+    ax5.grid(True)
+    lyap_V_line, = ax5.plot([], [], 'c-', linewidth=2, label='V(t)')
+    lyap_V_dot_line, = ax5.plot([], [], 'orange', linewidth=2, label='V̇(t)')
+    ax5.legend()
+
+    # Subplot Stability Margin
+    ax6 = axs[1, 2]
+    ax6.set_title('Stability Margin')
+    ax6.set_xlabel('Time [s]')
+    ax6.set_ylabel('Margin')
+    ax6.grid(True)
+    stability_line, = ax6.plot([], [], 'purple', linewidth=2, label='Stability Margin')
+    ax6.axhline(y=0, color='k', linestyle='--', alpha=0.5, label='Stability Threshold')
+    ax6.legend()
+
+    plt.tight_layout()
+    
+    print("🎮 Starting real-time simulation...")
+
+    # === Simulasi Loop ===
+    for k in range(N_sim):
+        t = k * simulation['dt']
+        t_vec[k] = t
+
+        # --- LOS Guidance ---
+        psi_d, e_ct, wpIdx = los_guidance(eta, simulation['waypoints'], wpIdx, simulation)
+        ct_err[k] = e_ct
+
+        # --- Control Law ---
+        e_psi = wrap_to_pi(eta[2] - psi_d)
+        hdg_err[k] = e_psi * 180 / np.pi
+
+        # Pre-trained Neural Network PID Control
+        u_control, control = neural_network_pid_control_pretrained(eta, nu, psi_d, simulation, control)
+        
+        # --- Lyapunov Stability Analysis ---
+        eta_d = np.array([simulation['waypoints'][min(wpIdx, len(simulation['waypoints'])-1)][0], 
+                         simulation['waypoints'][min(wpIdx, len(simulation['waypoints'])-1)][1], 
+                         psi_d])
+        nu_d = np.array([simulation['u_des'], 0.0, 0.0])
+        
+        lyap_analysis = lyapunov_stability_analysis(eta, nu, eta_d, nu_d, control)
+        lyapunov_V[k] = lyap_analysis['V']
+        lyapunov_V_dot[k] = lyap_analysis['V_dot']
+        stability_margin[k] = lyap_analysis['stability_margin']
+        sliding_surface_norm[k] = np.linalg.norm(lyap_analysis['sliding_surface'])
+        
+        # Simulasi gangguan lingkungan untuk testing adaptivitas
+        disturbance_force = np.array([0.0, 0.0])
+        if 25 <= t < 35:  # Gangguan 1: Ocean current
+            disturbance_force = np.array([0.8, 0.15])
+        elif 50 <= t < 60:  # Gangguan 2: Thruster failure simulation
+            disturbance_force = np.array([-0.5, -0.1])
+        
+        # Tambahkan gangguan ke control signal
+        u_control += disturbance_force
+        
+        # Store control input in control dict
+        control['u'] = u_control
+        tau_u = u_control[0]
+        tau_r = u_control[1]
+
+        # Simpan kontrol input untuk plot
+        control_u[k] = tau_u
+        control_r[k] = tau_r
+        
+        # Simpan PID gains untuk plot
+        kp_surge[k] = control['pretrained_surge'].Kp
+        ki_surge[k] = control['pretrained_surge'].Ki
+        kd_surge[k] = control['pretrained_surge'].Kd
+        kp_yaw[k] = control['pretrained_yaw'].Kp
+        ki_yaw[k] = control['pretrained_yaw'].Ki
+        kd_yaw[k] = control['pretrained_yaw'].Kd
+
+        # --- Sistem Dinamika ---
+        nudot, etadot = system_dynamics(eta, nu, forces, moments, control, hull, simulation)
+        nu += nudot * simulation['dt']
+        eta += etadot * simulation['dt']
+
+        # Log Trajectory
+        traj[k, 0:2] = eta[0:2]
+        traj[k, 2:5] = nu
+
+        # --- Real-time Visualization ---
+        if k % 10 == 0:
+            # Update AUV Shape
+            L = 2.0  # Length
+            W = 0.8  # Width
+            shape = np.array([
+                [L, -L/2, -L/2],
+                [0, -W/2, W/2]
+            ])
+            R_mat = np.array([
+                [np.cos(eta[2]), -np.sin(eta[2])],
+                [np.sin(eta[2]),  np.cos(eta[2])]
+            ])
+            shape_rot = R_mat @ shape
+            shape_rot += eta[0:2].reshape(2,1)
+            auv_shape.set_data(shape_rot[0,:], shape_rot[1,:])
+
+            # Update Trajectory
+            traj_line.set_data(traj[:k+1,0], traj[:k+1,1])
+
+            # Update Errors
+            err_ct_line.set_data(t_vec[:k+1], ct_err[:k+1])
+            err_hdg_line.set_data(t_vec[:k+1], hdg_err[:k+1])
+
+            # Update Control Inputs
+            tau_u_line.set_data(t_vec[:k+1], control_u[:k+1])
+            tau_r_line.set_data(t_vec[:k+1], control_r[:k+1])
+            
+            # Update Lyapunov Analysis
+            lyap_V_line.set_data(t_vec[:k+1], lyapunov_V[:k+1])
+            lyap_V_dot_line.set_data(t_vec[:k+1], lyapunov_V_dot[:k+1])
+            stability_line.set_data(t_vec[:k+1], stability_margin[:k+1])
+
+            # Update plot limits
+            if k > 0:
+                for ax in [ax2, ax3, ax4, ax5, ax6]:
+                    ax.set_xlim(0, t + simulation['dt'])
+
+            plt.pause(0.001)  # Pause kecil untuk update plot
+
+        # Check for simulation termination
+        if wpIdx >= len(simulation['waypoints'])-1 and abs(e_ct) < 0.5:
+            print(f"✅ Simulasi selesai pada waktu t = {t:.2f} detik - Target reached!")
+            break
+            
+        # Progress update
+        if k % 200 == 0 and k > 0:
+            print(f"⏱️  Time: {t:.1f}s, Position: ({eta[0]:.1f}, {eta[1]:.1f}), "
+                  f"Error: {e_ct:.2f}m, Stability: {'✅' if lyap_analysis['is_stable'] else '❌'}")
+
+    # === Final Plotting ===
+    plt.show()
+    
+    # === Comprehensive Analysis Plots ===
+    fig2, axs2 = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # Error Analysis
+    axs2[0,0].plot(t_vec, ct_err, 'b-', linewidth=2, label='Cross-Track Error')
+    axs2[0,0].set_title('Cross-Track Error over Time')
+    axs2[0,0].set_xlabel('Time [s]')
+    axs2[0,0].set_ylabel('e_ct [m]')
+    axs2[0,0].grid(True)
+    axs2[0,0].legend()
+
+    axs2[0,1].plot(t_vec, hdg_err, 'r-', linewidth=2, label='Heading Error')
+    axs2[0,1].set_title('Heading Error over Time')
+    axs2[0,1].set_xlabel('Time [s]')
+    axs2[0,1].set_ylabel('e_psi [deg]')
+    axs2[0,1].grid(True)
+    axs2[0,1].legend()
+
+    # Control Analysis
+    axs2[0,2].plot(t_vec, control_u, 'g-', linewidth=2, label='Surge Control')
+    axs2[0,2].plot(t_vec, control_r, 'm-', linewidth=2, label='Yaw Control')
+    axs2[0,2].set_title('Control Inputs')
+    axs2[0,2].set_xlabel('Time [s]')
+    axs2[0,2].set_ylabel('Control [N/Nm]')
+    axs2[0,2].grid(True)
+    axs2[0,2].legend()
+
+    # Lyapunov Analysis
+    axs2[1,0].plot(t_vec, lyapunov_V, 'c-', linewidth=2, label='V(t)')
+    axs2[1,0].set_title('Lyapunov Function')
+    axs2[1,0].set_xlabel('Time [s]')
+    axs2[1,0].set_ylabel('V')
+    axs2[1,0].grid(True)
+    axs2[1,0].legend()
+
+    axs2[1,1].plot(t_vec, lyapunov_V_dot, 'orange', linewidth=2, label='V̇(t)')
+    axs2[1,1].axhline(y=0, color='k', linestyle='--', alpha=0.5)
+    axs2[1,1].set_title('Lyapunov Function Derivative')
+    axs2[1,1].set_xlabel('Time [s]')
+    axs2[1,1].set_ylabel('V̇')
+    axs2[1,1].grid(True)
+    axs2[1,1].legend()
+
+    axs2[1,2].plot(t_vec, stability_margin, 'purple', linewidth=2, label='Stability Margin')
+    axs2[1,2].axhline(y=0, color='k', linestyle='--', alpha=0.5, label='Stability Threshold')
+    axs2[1,2].set_title('Stability Margin Analysis')
+    axs2[1,2].set_xlabel('Time [s]')
+    axs2[1,2].set_ylabel('Margin')
+    axs2[1,2].grid(True)
+    axs2[1,2].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # === Performance Summary ===
+    print("\n" + "="*60)
+    print("🎯 SIMULATION PERFORMANCE SUMMARY")
+    print("="*60)
+    print(f"Final position: x={eta[0]:.2f}m, y={eta[1]:.2f}m")
+    print(f"Final cross-track error: {e_ct:.3f}m")
+    print(f"Final heading error: {e_psi*180/np.pi:.2f}°")
+    print(f"RMS cross-track error: {np.sqrt(np.mean(ct_err[~np.isnan(ct_err)]**2)):.3f}m")
+    print(f"RMS heading error: {np.sqrt(np.mean(hdg_err[~np.isnan(hdg_err)]**2)):.3f}°")
+    print(f"Max control effort (surge): {np.max(np.abs(control_u[~np.isnan(control_u)])):.2f}N")
+    print(f"Max control effort (yaw): {np.max(np.abs(control_r[~np.isnan(control_r)])):.2f}Nm")
+    
+    # Stability Analysis Summary
+    stable_percentage = np.mean(stability_margin[~np.isnan(stability_margin)] >= 0) * 100
+    print(f"\n🔬 LYAPUNOV STABILITY ANALYSIS:")
+    print(f"Percentage of time stable: {stable_percentage:.1f}%")
+    print(f"Average Lyapunov function: {np.mean(lyapunov_V[~np.isnan(lyapunov_V)]):.3f}")
+    print(f"Average V̇: {np.mean(lyapunov_V_dot[~np.isnan(lyapunov_V_dot)]):.6f}")
+    print(f"Min stability margin: {np.min(stability_margin[~np.isnan(stability_margin)]):.3f}")
+    
+    # Neural Network Performance
+    print(f"\n🧠 NEURAL NETWORK GAINS (FINAL):")
+    print(f"Surge Controller: Kp={control['pretrained_surge'].Kp:.3f}, "
+          f"Ki={control['pretrained_surge'].Ki:.3f}, Kd={control['pretrained_surge'].Kd:.3f}")
+    print(f"Yaw Controller: Kp={control['pretrained_yaw'].Kp:.3f}, "
+          f"Ki={control['pretrained_yaw'].Ki:.3f}, Kd={control['pretrained_yaw'].Kd:.3f}")
+    print("="*60)
+    # Inisialisasi Parameter
+    hull, forces, moments, control, simulation = initialize_parameters()
+
+    # Inisialisasi Kondisi Awal
+    eta = np.array([0.0, 0.0, 0.0])    # [x, y, psi] - start at origin
+    nu = np.array([0.1, 0.0, 0.0])     # [u, v, r] - small initial velocity
+    wpIdx = 0
+    int_eu = 0.0
+
+    # Inisialisasi Log Data
+    N_sim = int(np.ceil(simulation['Tend'] / simulation['dt'])) + 1
+    traj = np.full((N_sim, 5), np.nan)   # x, y, u, v, r
+    ct_err = np.full(N_sim, np.nan)
+    hdg_err = np.full(N_sim, np.nan)
+    t_vec = np.full(N_sim, np.nan)
+    control_u = np.full(N_sim, np.nan)
+    control_r = np.full(N_sim, np.nan)
+    
+    # Neural Network PID gains logging
+    kp_surge = np.full(N_sim, np.nan)
+    ki_surge = np.full(N_sim, np.nan)
+    kd_surge = np.full(N_sim, np.nan)
+    kp_yaw = np.full(N_sim, np.nan)
+    ki_yaw = np.full(N_sim, np.nan)
+    kd_yaw = np.full(N_sim, np.nan)
+
+    # === Plot Setup ===
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    # Subplot AUV XY Plane
+    ax1 = axs[0, 0]
+    ax1.set_title('AUV XY Plane')
+    ax1.set_xlabel('East [m]')
+    ax1.set_ylabel('North [m]')
+    ax1.plot(simulation['waypoints'][:,0], simulation['waypoints'][:,1], 'k--', linewidth=1.5, label='Waypoints')
+    ax1.plot(simulation['waypoints'][:,0], simulation['waypoints'][:,1], 'ko', markerfacecolor='k')
+    ax1.set_xlim(-5, 40)
+    ax1.set_ylim(-5, 30)
+    ax1.grid(True)
+    auv_shape, = ax1.plot([], [], 'b-')  # AUV shape
+    traj_line, = ax1.plot([], [], 'r-', label='Trajectory')
+
+    # Subplot Cross-Track Error
+    ax2 = axs[0, 1]
+    ax2.set_title('Cross-Track Error')
+    ax2.set_xlabel('Time [s]')
+    ax2.set_ylabel('e_ct [m]')
+    ax2.set_ylim(-5, 5)
+    ax2.grid(True)
+    err_ct_line, = ax2.plot([], [], 'b-')
+
+    # Subplot Heading Error
+    ax3 = axs[1, 0]
+    ax3.set_title('Heading Error')
+    ax3.set_xlabel('Time [s]')
+    ax3.set_ylabel('e_psi [deg]')
+    ax3.set_ylim(-180, 180)
+    ax3.grid(True)
+    err_hdg_line, = ax3.plot([], [], 'r-')
+
+    # Subplot Control Inputs
+    ax4 = axs[1, 1]
+    ax4.set_title('Control Inputs')
+    ax4.set_xlabel('Time [s]')
+    ax4.set_ylabel('Control [N/Rad]')
+    ax4.set_ylim(-100, 100)
+    ax4.grid(True)
+    tau_u_line, = ax4.plot([], [], 'g-', label='Surge (tau_u)')
+    tau_r_line, = ax4.plot([], [], 'm-', label='Yaw (tau_r)')
+    ax4.legend()
+
+    plt.tight_layout()
+
+    # === Simulasi Loop ===
+    for k in range(N_sim):
+        t = k * simulation['dt']
+        t_vec[k] = t
+
+        # --- LOS Guidance ---
+        psi_d, e_ct, wpIdx = los_guidance(eta, simulation['waypoints'], wpIdx, simulation)
+        ct_err[k] = e_ct
+
+        # --- Control Law ---
+        e_psi = wrap_to_pi(eta[2] - psi_d)
+        hdg_err[k] = e_psi * 180 / np.pi
+
+        # Neural Network PID Control
+        u_control, control = neural_network_pid_control(eta, nu, psi_d, simulation, control)
+        
+        # Simulasi gangguan lingkungan untuk testing adaptivitas Neural Network
+        disturbance_force = np.array([0.0, 0.0])
+        if 20 <= t < 30:  # Gangguan 1: Ocean current
+            disturbance_force = np.array([0.5, 0.1])  # [surge, yaw] disturbance
+        elif 60 <= t < 70:  # Gangguan 2: Thruster failure simulation
+            disturbance_force = np.array([-0.3, -0.05])
+        
+        # Tambahkan gangguan ke control signal
+        u_control += disturbance_force
+        
+        # Store control input in control dict
+        control['u'] = u_control
+        # Assign kontrol input
+        tau_u = u_control[0]
+        tau_r = u_control[1]
+
+        # Simpan kontrol input untuk plot
+        control_u[k] = tau_u
+        control_r[k] = tau_r
+        
+        # Simpan PID gains untuk plot
+        kp_surge[k] = control['nn_pid_surge'].Kp
+        ki_surge[k] = control['nn_pid_surge'].Ki
+        kd_surge[k] = control['nn_pid_surge'].Kd
+        kp_yaw[k] = control['nn_pid_yaw'].Kp
+        ki_yaw[k] = control['nn_pid_yaw'].Ki
+        kd_yaw[k] = control['nn_pid_yaw'].Kd
+
+        # --- Sistem Dinamika ---
+        nudot, etadot = system_dynamics(eta, nu, forces, moments, control, hull, simulation)
+        # Update state
+        nu += nudot * simulation['dt']
+        eta += etadot * simulation['dt']
+
+        # Log Trajectory
+        traj[k, 0:2] = eta[0:2]
+        traj[k, 2:5] = nu
+
+        # --- Visualisasi ---
+        if k % 10 == 0:
+            # Update AUV Shape
+            L = 1.2  # Length
+            W = 0.5  # Width
+            shape = np.array([
+                [L, -L/2, -L/2],
+                [0, -W/2, W/2]
+            ])
+            R_mat = np.array([
+                [np.cos(eta[2]), -np.sin(eta[2])],
+                [np.sin(eta[2]),  np.cos(eta[2])]
+            ])
+            shape_rot = R_mat @ shape
+            shape_rot += eta[0:2].reshape(2,1)
+            auv_shape.set_data(shape_rot[0,:], shape_rot[1,:])
+
+            # Update Trajectory
+            traj_line.set_data(traj[:k+1,0], traj[:k+1,1])
+
+            # Update Errors
+            err_ct_line.set_data(t_vec[:k+1], ct_err[:k+1])
+            err_hdg_line.set_data(t_vec[:k+1], hdg_err[:k+1])
+
+            # Update Control Inputs
+            tau_u_line.set_data(t_vec[:k+1], control_u[:k+1])
+            tau_r_line.set_data(t_vec[:k+1], control_r[:k+1])
+
+            # Update plot limits
+            if k > 0:
+                ax2.set_xlim(0, t + simulation['dt'])
+                ax3.set_xlim(0, t + simulation['dt'])
+                ax4.set_xlim(0, t + simulation['dt'])
+
+            plt.pause(0.001)  # Pause kecil untuk update plot
+
+        # Check for simulation termination
+        if wpIdx >= len(simulation['waypoints'])-1 and e_ct == 0.0:
+            print(f"✅ Simulasi selesai pada waktu t = {t:.2f} detik")
+            break
+
+    # === Plotting Akhir ===
+    plt.show()
+
+    # === Plot Error dan Kontrol Inputs secara Terpisah ===
+    fig2, axs2 = plt.subplots(2, 1, figsize=(14, 10))
+    
+    axs2[0].plot(t_vec, ct_err, 'b-', label='Cross-Track Error')
+    axs2[0].set_title('Cross-Track Error over Time')
+    axs2[0].set_xlabel('Time [s]')
+    axs2[0].set_ylabel('e_ct [m]')
+    axs2[0].grid(True)
+    axs2[0].legend()
+
+    axs2[1].plot(t_vec, hdg_err, 'r-', label='Heading Error')
+    axs2[1].set_title('Heading Error over Time')
+    axs2[1].set_xlabel('Time [s]')
+    axs2[1].set_ylabel('e_psi [deg]')
+    axs2[1].grid(True)
+    axs2[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # === Plot Control Inputs ===
+    fig3, axs3 = plt.subplots(2, 1, figsize=(14, 10))
+    
+    axs3[0].plot(t_vec, control_u, 'g-', label='Surge Control (tau_u)')
+    axs3[0].set_title('Surge Control Input over Time')
+    axs3[0].set_xlabel('Time [s]')
+    axs3[0].set_ylabel('tau_u [N]')
+    axs3[0].grid(True)
+    axs3[0].legend()
+
+    axs3[1].plot(t_vec, control_r, 'm-', label='Yaw Control (tau_r)')
+    axs3[1].set_title('Yaw Control Input over Time')
+    axs3[1].set_xlabel('Time [s]')
+    axs3[1].set_ylabel('tau_r [Nm]')
+    axs3[1].grid(True)
+    axs3[1].legend()
+
+    plt.tight_layout()
+    plt.show()
+
+    # === Plot Neural Network PID Gains Evolution ===
+    fig4, axs4 = plt.subplots(2, 3, figsize=(18, 10))
+    
+    # Surge PID gains
+    axs4[0, 0].plot(t_vec, kp_surge, 'r-', label='Kp Surge')
+    axs4[0, 0].set_title('Surge Proportional Gain (Kp)')
+    axs4[0, 0].set_xlabel('Time [s]')
+    axs4[0, 0].set_ylabel('Kp')
+    axs4[0, 0].grid(True)
+    
+    axs4[0, 1].plot(t_vec, ki_surge, 'g-', label='Ki Surge')
+    axs4[0, 1].set_title('Surge Integral Gain (Ki)')
+    axs4[0, 1].set_xlabel('Time [s]')
+    axs4[0, 1].set_ylabel('Ki')
+    axs4[0, 1].grid(True)
+    
+    axs4[0, 2].plot(t_vec, kd_surge, 'b-', label='Kd Surge')
+    axs4[0, 2].set_title('Surge Derivative Gain (Kd)')
+    axs4[0, 2].set_xlabel('Time [s]')
+    axs4[0, 2].set_ylabel('Kd')
+    axs4[0, 2].grid(True)
+    
+    # Yaw PID gains
+    axs4[1, 0].plot(t_vec, kp_yaw, 'r-', label='Kp Yaw')
+    axs4[1, 0].set_title('Yaw Proportional Gain (Kp)')
+    axs4[1, 0].set_xlabel('Time [s]')
+    axs4[1, 0].set_ylabel('Kp')
+    axs4[1, 0].grid(True)
+    
+    axs4[1, 1].plot(t_vec, ki_yaw, 'g-', label='Ki Yaw')
+    axs4[1, 1].set_title('Yaw Integral Gain (Ki)')
+    axs4[1, 1].set_xlabel('Time [s]')
+    axs4[1, 1].set_ylabel('Ki')
+    axs4[1, 1].grid(True)
+    
+    axs4[1, 2].plot(t_vec, kd_yaw, 'b-', label='Kd Yaw')
+    axs4[1, 2].set_title('Yaw Derivative Gain (Kd)')
+    axs4[1, 2].set_xlabel('Time [s]')
+    axs4[1, 2].set_ylabel('Kd')
+    axs4[1, 2].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    print("=== Simulation Completed ===")
+    print(f"Final position: x={eta[0]:.2f}m, y={eta[1]:.2f}m")
+    print(f"Final cross-track error: {e_ct:.2f}m")
+    print(f"Final heading error: {e_psi*180/np.pi:.2f}°")
+    print(f"Final surge PID gains: Kp={control['nn_pid_surge'].Kp:.3f}, Ki={control['nn_pid_surge'].Ki:.3f}, Kd={control['nn_pid_surge'].Kd:.3f}")
+    print(f"Final yaw PID gains: Kp={control['nn_pid_yaw'].Kp:.3f}, Ki={control['nn_pid_yaw'].Ki:.3f}, Kd={control['nn_pid_yaw'].Kd:.3f}")
+
+
+def rl_training_simulation(num_epochs=10):
+    """
+    Run RL controller training over multiple epochs
+    """
+    print("=== Starting RL Controller Training ===")
+    print(f"Training for {num_epochs} epochs...")
+    
+    # Track training progress
+    epoch_errors = []
+    epoch_rewards = []
+    
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        
+        # Inisialisasi Parameter untuk setiap epoch
+        hull, forces, moments, control, simulation = initialize_parameters()
+        
+        # Reduce simulation time for training
+        simulation['Tend'] = 60.0  # Shorter episodes for training
+        
+        # Inisialisasi Kondisi Awal
+        eta = np.array([0.0, 0.0, 0.0])
+        nu = np.array([0.1, 0.0, 0.0])
+        wpIdx = 0
+        
+        # Episode tracking
+        episode_error = 0.0
+        episode_reward = 0.0
+        step_count = 0
+        
+        N_sim = int(np.ceil(simulation['Tend'] / simulation['dt'])) + 1
+        
+        for k in range(N_sim):
+            t = k * simulation['dt']
+            
+            # LOS Guidance
+            psi_d, e_ct, wpIdx = los_guidance(eta, simulation['waypoints'], wpIdx, simulation)
+            
+            # Control with RL
+            u_control, control = rl_model_free_control(eta, nu, psi_d, simulation, control)
+            
+            # Add training disturbances for robustness
+            if epoch % 3 == 0:  # Every 3rd epoch add disturbance
+                disturbance = np.array([0.2*np.sin(t), 0.1*np.cos(t)])
+                u_control += disturbance
+            
+            control['u'] = u_control
+            
+            # System dynamics
+            nudot, etadot = system_dynamics(eta, nu, forces, moments, control, hull, simulation)
+            nu += nudot * simulation['dt']
+            eta += etadot * simulation['dt']
+            
+            # Track performance
+            episode_error += abs(e_ct)
+            e_psi = wrap_to_pi(eta[2] - psi_d)
+            episode_reward -= (e_ct**2 + e_psi**2)  # Negative error as reward
+            step_count += 1
+        
+        # Store epoch performance
+        avg_error = episode_error / step_count
+        avg_reward = episode_reward / step_count
+        epoch_errors.append(avg_error)
+        epoch_rewards.append(avg_reward)
+        
+        print(f"  Average error: {avg_error:.3f}m")
+        print(f"  Average reward: {avg_reward:.3f}")
+        
+        # Learning rate decay
+        if hasattr(control['rl_controller'], 'learning_rate'):
+            control['rl_controller'].learning_rate *= 0.95
+    
+    print("\n=== Training Completed ===")
+    print(f"Initial average error: {epoch_errors[0]:.3f}m")
+    print(f"Final average error: {epoch_errors[-1]:.3f}m")
+    print(f"Improvement: {((epoch_errors[0] - epoch_errors[-1])/epoch_errors[0]*100):.1f}%")
+    
+    # Plot training progress
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    
+    ax1.plot(range(1, num_epochs+1), epoch_errors, 'b-o')
+    ax1.set_title('Training Progress - Average Error')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Average Cross-track Error [m]')
+    ax1.grid(True)
+    
+    ax2.plot(range(1, num_epochs+1), epoch_rewards, 'g-o')
+    ax2.set_title('Training Progress - Average Reward')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Average Reward')
+    ax2.grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return epoch_errors, epoch_rewards
+
+
+def rl_evaluation_simulation():
+    """
+    Run RL controller evaluation after training
+    """
+    print("\n=== Starting RL Controller Evaluation ===")
+    
+    # Inisialisasi Parameter
+    hull, forces, moments, control, simulation = initialize_parameters()
+
+    # Inisialisasi Kondisi Awal
+    eta = np.array([0.0, 0.0, 0.0])
+    nu = np.array([0.1, 0.0, 0.0])
+    wpIdx = 0
+
+    # Inisialisasi Log Data
+    N_sim = int(np.ceil(simulation['Tend'] / simulation['dt'])) + 1
+    traj = np.full((N_sim, 5), np.nan)
+    ct_err = np.full(N_sim, np.nan)
+    hdg_err = np.full(N_sim, np.nan)
+    t_vec = np.full(N_sim, np.nan)
+    control_u = np.full(N_sim, np.nan)
+    control_r = np.full(N_sim, np.nan)
+    rl_values = np.full(N_sim, np.nan)
+
+    # === Simulasi Loop ===
+    print("Running evaluation simulation...")
+    for k in range(N_sim):
+        t = k * simulation['dt']
+        t_vec[k] = t
+
+        # LOS Guidance
+        psi_d, e_ct, wpIdx = los_guidance(eta, simulation['waypoints'], wpIdx, simulation)
+        ct_err[k] = e_ct
+
+        # Control Law dengan RL
+        e_psi = wrap_to_pi(eta[2] - psi_d)
+        hdg_err[k] = e_psi * 180 / np.pi
+
+        u_control, control = rl_model_free_control(eta, nu, psi_d, simulation, control)
+        
+        # Evaluation disturbances
+        if 30 <= t < 40:
+            u_control += np.array([0.5, 0.1])
+        elif 70 <= t < 80:
+            u_control += np.array([-0.3, -0.05])
+        
+        control['u'] = u_control
+        control_u[k] = u_control[0]
+        control_r[k] = u_control[1]
+        
+        # Log RL value function
+        if 'rl_value_function' in control and len(control['rl_value_function']) > 0:
+            rl_values[k] = control['rl_value_function'][-1]
+
+        # System dynamics
+        nudot, etadot = system_dynamics(eta, nu, forces, moments, control, hull, simulation)
+        nu += nudot * simulation['dt']
+        eta += etadot * simulation['dt']
+
+        # Log Trajectory
+        traj[k, 0:2] = eta[0:2]
+        traj[k, 2:5] = nu
+
+    # === Plotting Results ===
+    print("Generating evaluation plots...")
+    
+    # Trajectory plot
+    fig1, ax = plt.subplots(1, 1, figsize=(12, 8))
+    ax.plot(simulation['waypoints'][:,0], simulation['waypoints'][:,1], 'k--', linewidth=2, label='Waypoints')
+    ax.plot(simulation['waypoints'][:,0], simulation['waypoints'][:,1], 'ko', markersize=8)
+    ax.plot(traj[:, 0], traj[:, 1], 'r-', linewidth=2, label='RL Controller Trajectory')
+    ax.plot(traj[0, 0], traj[0, 1], 'go', markersize=10, label='Start')
+    ax.plot(traj[-1, 0], traj[-1, 1], 'ro', markersize=10, label='End')
+    ax.set_title('RL Controller - AUV Trajectory')
+    ax.set_xlabel('East [m]')
+    ax.set_ylabel('North [m]')
+    ax.grid(True)
+    ax.legend()
+    ax.axis('equal')
+    plt.show()
+
+    # Error and control plots
+    fig2, axs = plt.subplots(2, 2, figsize=(14, 10))
+    
+    axs[0,0].plot(t_vec, ct_err, 'b-', linewidth=2)
+    axs[0,0].set_title('Cross-Track Error')
+    axs[0,0].set_xlabel('Time [s]')
+    axs[0,0].set_ylabel('e_ct [m]')
+    axs[0,0].grid(True)
+
+    axs[0,1].plot(t_vec, hdg_err, 'r-', linewidth=2)
+    axs[0,1].set_title('Heading Error')
+    axs[0,1].set_xlabel('Time [s]')
+    axs[0,1].set_ylabel('e_psi [deg]')
+    axs[0,1].grid(True)
+
+    axs[1,0].plot(t_vec, control_u, 'g-', linewidth=2, label='Surge Control')
+    axs[1,0].plot(t_vec, control_r, 'm-', linewidth=2, label='Yaw Control')
+    axs[1,0].set_title('Control Inputs')
+    axs[1,0].set_xlabel('Time [s]')
+    axs[1,0].set_ylabel('Control [N/Nm]')
+    axs[1,0].grid(True)
+    axs[1,0].legend()
+
+    axs[1,1].plot(t_vec, rl_values, 'c-', linewidth=2)
+    axs[1,1].set_title('RL Value Function')
+    axs[1,1].set_xlabel('Time [s]')
+    axs[1,1].set_ylabel('Value')
+    axs[1,1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    print("=== RL Evaluation Completed ===")
+    print(f"Final position: x={eta[0]:.2f}m, y={eta[1]:.2f}m")
+    print(f"Final cross-track error: {e_ct:.2f}m")
+    print(f"Final heading error: {e_psi*180/np.pi:.2f}°")
+    print(f"RMS cross-track error: {np.sqrt(np.mean(ct_err**2)):.3f}m")
+    print(f"RMS heading error: {np.sqrt(np.mean(hdg_err**2)):.3f}°")
+
+
+def run_controller_comparison():
+    """
+    Run comparison between Neural Network PID and RL controllers
+    """
+    print("=== Controller Comparison ===")
+    
+    # Run Pre-trained NN-PID simulation
+    print("\n1. Running Pre-Trained Neural Network PID Controller...")
+    auv_adaptive_simulation_with_pretraining()
+    
+    # Train RL controller
+    print("\n2. Training RL Controller...")
+    rl_training_simulation(num_epochs=15)
+    
+    # Evaluate RL controller
+    print("\n3. Evaluating trained RL Controller...")
+    rl_evaluation_simulation()
+    
+    print("\n=== Comparison Complete ===")
+
+def lyapunov_stability_analysis(eta, nu, eta_d, nu_d, control_params):
+    """
+    Analisis stabilitas Lyapunov untuk kontrol AUV
+    Berdasarkan Section 7.6.1 Stability Analysis
+    
+    Parameters:
+        eta: Current position and orientation [x, y, psi]
+        nu: Current velocity [u, v, r]
+        eta_d: Desired position and orientation [x_d, y_d, psi_d]
+        nu_d: Desired velocity [u_d, v_d, r_d]
+        control_params: Control parameters dictionary
+    
+    Returns:
+        V: Lyapunov function value
+        V_dot: Time derivative of Lyapunov function
+        stability_margin: Stability margin
+    """
+    # Error vectors
+    eta_tilde = eta - eta_d  # Position/orientation error
+    nu_tilde = nu - nu_d     # Velocity error
+    
+    # Sliding surface parameter Lambda
+    Lambda = np.diag([0.5, 0.5, 1.0])  # blockdiag{Λp, Λo, Λq}
+    
+    # Sliding surface s = nu_tilde + Lambda * eta_tilde
+    s = nu_tilde + Lambda @ eta_tilde
+    
+    # Mass matrix M(q) - simplified for 3DOF
+    m = 10.0  # kg
+    I_z = 1.0  # kg*m^2
+    M = np.diag([m, m, I_z])
+    
+    # Lyapunov function V = (1/2) * s^T * M * s
+    V = 0.5 * s.T @ M @ s
+    
+    # Damping matrix D
+    D = np.diag([0.5, 0.5, 0.2])
+    
+    # Control gains
+    K_D = np.diag([5.0, 5.0, 2.0])  # Derivative gain
+    K_S = np.diag([10.0, 10.0, 5.0])  # Sliding gain
+    
+    # Coriolis matrix C (simplified)
+    r = nu[2]
+    C = np.array([
+        [0, 0, -m*nu[1]],
+        [0, 0, m*nu[0]], 
+        [m*nu[1], -m*nu[0], 0]
+    ])
+    
+    # Gravitational/buoyancy forces (simplified for surface vehicle)
+    g = np.array([0, 0, 0])
+    
+    # Model uncertainties (bounded)
+    g_tilde = np.array([0.1, 0.1, 0.05])  # Estimated uncertainty
+    
+    # Calculate V_dot according to equation (7.13)
+    # V_dot = -s^T * (D + K_D) * s + s^T * [M*nu_d_dot + (C+D)*nu + g_tilde - K_S*sign(s)]
+    
+    # Desired acceleration (assumed zero for regulation)
+    nu_d_dot = np.zeros(3)
+    
+    # Sign function with boundary layer to avoid chattering
+    epsilon = 0.1  # Boundary layer thickness
+    sign_s = np.zeros_like(s)
+    for i in range(len(s)):
+        if abs(s[i]) > epsilon:
+            sign_s[i] = np.sign(s[i])
+        else:
+            sign_s[i] = s[i] / epsilon
+    
+    # Calculate terms in V_dot
+    damping_term = -s.T @ (D + K_D) @ s
+    uncertainty_term = s.T @ (M @ nu_d_dot + (C + D) @ nu + g_tilde - K_S @ sign_s)
+    
+    V_dot = damping_term + uncertainty_term
+    
+    # Stability conditions check
+    lambda_min_KD_D = np.min(np.linalg.eigvals(K_D + D))
+    lambda_min_KS = np.min(np.linalg.eigvals(K_S))
+    
+    # Upper bound for uncertainty terms
+    uncertainty_bound = np.linalg.norm(M @ nu_d_dot + (C + D) @ nu + g_tilde)
+    
+    # Stability margin (should be positive for stability)
+    stability_margin = lambda_min_KS - uncertainty_bound
+    
+    # Check stability condition: λ_min(K_S) ≥ ||M*nu_d_dot + (C+D)*nu + g_tilde||
+    is_stable = stability_margin >= 0
+    
+    return {
+        'V': V,
+        'V_dot': V_dot,
+        'stability_margin': stability_margin,
+        'is_stable': is_stable,
+        'sliding_surface': s,
+        'lambda_min_KS': lambda_min_KS,
+        'uncertainty_bound': uncertainty_bound,
+        'damping_term': damping_term,
+        'uncertainty_term': uncertainty_term
+    }
+
+
+def pre_train_neural_networks(epochs=1000):
+    """
+    Pre-training Neural Network PID controllers dengan data sintetis
+    untuk mempersiapkan controller sebelum simulasi utama
+    
+    Parameters:
+        epochs: Number of training epochs
+    
+    Returns:
+        trained_controllers: Dictionary dengan trained NN-PID controllers
+    """
+    print(f"🧠 Starting Neural Network Pre-Training for {epochs} epochs...")
+    
+    # Initialize controllers
+    nn_pid_surge = NeuralNetworkPID(learning_rate=0.01)
+    nn_pid_yaw = NeuralNetworkPID(learning_rate=0.01)
+    
+    # Training data generation parameters
+    dt = 0.05
+    training_time = 60.0
+    N_train = int(training_time / dt)
+    
+    # Track training progress
+    surge_errors = []
+    yaw_errors = []
+    surge_gains_history = {'Kp': [], 'Ki': [], 'Kd': []}
+    yaw_gains_history = {'Kp': [], 'Ki': [], 'Kd': []}
+    
+    print("Generating synthetic training data...")
+    
+    for epoch in range(epochs):
+        # Reset for each epoch
+        epoch_surge_error = 0.0
+        epoch_yaw_error = 0.0
+        
+        # Generate different reference signals for variety
+        if epoch % 4 == 0:
+            # Step response training
+            surge_ref_func = lambda t: 1.0 if t > 10 else 0.5
+            yaw_ref_func = lambda t: np.pi/4 if t > 15 else 0.0
+        elif epoch % 4 == 1:
+            # Sinusoidal reference training
+            surge_ref_func = lambda t: 0.8 + 0.3*np.sin(0.1*t)
+            yaw_ref_func = lambda t: 0.5*np.sin(0.05*t)
+        elif epoch % 4 == 2:
+            # Ramp reference training
+            surge_ref_func = lambda t: min(1.2, 0.02*t)
+            yaw_ref_func = lambda t: min(np.pi/3, 0.01*t)
+        else:
+            # Random reference training
+            surge_ref_func = lambda t: 0.5 + 0.4*np.random.uniform(-1, 1)
+            yaw_ref_func = lambda t: 0.3*np.random.uniform(-1, 1)
+        
+        # Simulate plant responses (simplified AUV dynamics)
+        surge_velocity = 0.1
+        yaw_angle = 0.0
+        
+        for k in range(N_train):
+            t = k * dt
+            
+            # Generate references
+            surge_ref = surge_ref_func(t)
+            yaw_ref = yaw_ref_func(t)
+            
+            # Train surge controller
+            surge_control = nn_pid_surge.pid_control(surge_ref, surge_velocity, dt)
+            surge_error = abs(surge_ref - surge_velocity)
+            epoch_surge_error += surge_error
+            
+            # Train yaw controller
+            yaw_control = nn_pid_yaw.pid_control(yaw_ref, yaw_angle, dt)
+            yaw_error = abs(yaw_ref - yaw_angle)
+            epoch_yaw_error += yaw_error
+            
+            # Simple plant model update
+            surge_velocity += dt * (0.1 * surge_control - 0.05 * surge_velocity)
+            yaw_angle += dt * (0.2 * yaw_control - 0.1 * yaw_angle)
+            
+            # Add noise for robustness
+            surge_velocity += 0.01 * np.random.normal()
+            yaw_angle += 0.005 * np.random.normal()
+        
+        # Store epoch results
+        avg_surge_error = epoch_surge_error / N_train
+        avg_yaw_error = epoch_yaw_error / N_train
+        surge_errors.append(avg_surge_error)
+        yaw_errors.append(avg_yaw_error)
+        
+        # Store gains history
+        surge_gains_history['Kp'].append(nn_pid_surge.Kp)
+        surge_gains_history['Ki'].append(nn_pid_surge.Ki)
+        surge_gains_history['Kd'].append(nn_pid_surge.Kd)
+        yaw_gains_history['Kp'].append(nn_pid_yaw.Kp)
+        yaw_gains_history['Ki'].append(nn_pid_yaw.Ki)
+        yaw_gains_history['Kd'].append(nn_pid_yaw.Kd)
+        
+        # Progress reporting
+        if (epoch + 1) % 100 == 0:
+            print(f"  Epoch {epoch+1:4d}/{epochs}: "
+                  f"Surge Error = {avg_surge_error:.4f}, "
+                  f"Yaw Error = {avg_yaw_error:.4f}")
+    
+    print("✅ Neural Network Pre-Training Completed!")
+    print(f"Final Surge Controller Gains: Kp={nn_pid_surge.Kp:.3f}, Ki={nn_pid_surge.Ki:.3f}, Kd={nn_pid_surge.Kd:.3f}")
+    print(f"Final Yaw Controller Gains: Kp={nn_pid_yaw.Kp:.3f}, Ki={nn_pid_yaw.Ki:.3f}, Kd={nn_pid_yaw.Kd:.3f}")
+    
+    # Plot training progress
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Training errors
+    ax1.plot(surge_errors, 'b-', linewidth=2, label='Surge Error')
+    ax1.set_title('Surge Controller Training Error')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Average Error')
+    ax1.grid(True)
+    ax1.legend()
+    
+    ax2.plot(yaw_errors, 'r-', linewidth=2, label='Yaw Error')
+    ax2.set_title('Yaw Controller Training Error') 
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Average Error')
+    ax2.grid(True)
+    ax2.legend();
+    
+    # Gains evolution
+    ax3.plot(surge_gains_history['Kp'], 'r-', label='Kp', linewidth=2)
+    ax3.plot(surge_gains_history['Ki'], 'g-', label='Ki', linewidth=2)
+    ax3.plot(surge_gains_history['Kd'], 'b-', label='Kd', linewidth=2)
+    ax3.set_title('Surge Controller Gains Evolution')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Gain Value')
+    ax3.grid(True)
+    ax3.legend()
+    
+    ax4.plot(yaw_gains_history['Kp'], 'r-', label='Kp', linewidth=2)
+    ax4.plot(yaw_gains_history['Ki'], 'g-', label='Ki', linewidth=2)
+    ax4.plot(yaw_gains_history['Kd'], 'b-', label='Kd', linewidth=2)
+    ax4.set_title('Yaw Controller Gains Evolution')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Gain Value')
+    ax4.grid(True)
+    ax4.legend()
+
+    plt.tight_layout()
+    plt.show()
+    
+    return {
+        'nn_pid_surge': nn_pid_surge,
+        'nn_pid_yaw': nn_pid_yaw,
+        'training_history': {
+            'surge_errors': surge_errors,
+            'yaw_errors': yaw_errors,
+            'surge_gains': surge_gains_history,
+            'yaw_gains': yaw_gains_history
+        }
+    }
+
+
+def neural_network_pid_control_pretrained(eta, nu, psi_d, simulation, control):
+    """
+    Neural Network PID Control dengan pre-trained controllers
+    """
+    dt = simulation['dt']
+    
+    # Use pre-trained controllers if available
+    if 'pretrained_surge' in control:
+        nn_pid_surge = control['pretrained_surge']
+    else:
+        nn_pid_surge = control['nn_pid_surge']
+    
+    if 'pretrained_yaw' in control:
+        nn_pid_yaw = control['pretrained_yaw']
+    else:
+        nn_pid_yaw = control['nn_pid_yaw']
+    
+    # Surge control (velocity control)
+    current_surge_velocity = nu[0]
+    desired_surge_velocity = simulation['u_des']
+    tau_u = nn_pid_surge.pid_control(desired_surge_velocity, current_surge_velocity, dt)
+    
+    # Yaw control (heading control)
+    current_heading = eta[2]
+    heading_error = wrap_to_pi(current_heading - psi_d)
+    tau_r = nn_pid_yaw.pid_control(0.0, heading_error, dt)  # Target heading error = 0
+    
+    # Saturation
+    tau_u = np.clip(tau_u, -100.0, 100.0)
+    tau_r = np.clip(tau_r, -50.0, 50.0)
+    
+    u = np.array([tau_u, tau_r])
+    
+    return u, control
+
+if __name__ == "__main__":
+    print("🌊 AUV Advanced Control Simulation with Lyapunov Stability Analysis")
+    print("="*70)
+    print("Available simulation modes:")
+    print("1. Pre-Trained Neural Network PID with Lyapunov Analysis (RECOMMENDED)")
+    print("2. Standard Neural Network PID (without pre-training)")
+    print("3. RL Controller Training + Evaluation")
+    print("4. Full Controller Comparison")
+    
+    try:
+        choice = input("\nSelect simulation mode (1-4): ").strip()
+        
+        if choice == "1":
+            print("\n🚀 Running Pre-Trained Neural Network PID simulation...")
+            print("This includes 1000-epoch pre-training + Lyapunov stability analysis")
+            auv_adaptive_simulation_with_pretraining()
+            
+        elif choice == "2":
+            print("\n🎯 Running standard Neural Network PID simulation...")
+            print("Note: This uses standard NN-PID without pre-training")
+            # Call the legacy version that doesn't require pre-training
+            # Initialize parameters
+            hull, forces, moments, control, simulation = initialize_parameters()
+            eta = np.array([0.0, 0.0, 0.0])
+            nu = np.array([0.1, 0.0, 0.0])
+            wpIdx = 0
+            
+            # Simple simulation loop without pre-training
+            N_sim = int(np.ceil(simulation['Tend'] / simulation['dt'])) + 1
+            for k in range(N_sim):
+                t = k * simulation['dt']
+                psi_d, e_ct, wpIdx = los_guidance(eta, simulation['waypoints'], wpIdx, simulation)
+                u_control, control = neural_network_pid_control(eta, nu, psi_d, simulation, control)
+                control['u'] = u_control
+                nudot, etadot = system_dynamics(eta, nu, forces, moments, control, hull, simulation)
+                nu += nudot * simulation['dt']
+                eta += etadot * simulation['dt']
+                
+                if wpIdx >= len(simulation['waypoints'])-1 and abs(e_ct) < 0.5:
+                    print(f"✅ Standard simulation completed at t = {t:.2f}s")
+                    break
+            
+            print(f"Final position: x={eta[0]:.2f}m, y={eta[1]:.2f}m")
+            print(f"Final error: {e_ct:.3f}m")
+            
+        elif choice == "3":
+            print("\n🤖 Running RL Controller training and evaluation...")
+            rl_training_simulation(num_epochs=15)
+            rl_evaluation_simulation()
+            
+        elif choice == "4":
+            print("\n⚖️  Running full controller comparison...")
+            run_controller_comparison()
+            
+        else:
+            print("❌ Invalid choice. Running Pre-Trained NN-PID by default...")
+            auv_adaptive_simulation_with_pretraining()
+            
+    except KeyboardInterrupt:
+        print("\n⏹️  Simulation interrupted by user.")
+    except Exception as e:
+        print(f"\n❌ Error during simulation: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n🔄 Running Pre-Trained NN-PID simulation as fallback...")
+        auv_adaptive_simulation_with_pretraining()
